@@ -1,0 +1,17 @@
+LSE SMART SCANNER v12.52.1 — VALIDATION REPORT
+===============================================
+
+Workflow YAML: PASS (parsed successfully; duplicate-key check passed)
+Embedded Python blocks: PASS (15 blocks AST/compile checked)
+Embedded shell run blocks: PASS (bash -n checked)
+Standalone scanner Python: PASS (AST + compile checked)
+Telegram bot Python: PASS (AST + compile checked)
+500,000-byte file-size ceiling: PASS (all delivered files are below the limit)
+
+Corrected workflow errors:
+1. Fixed the invalid Python assert with three comma-separated arguments.
+2. Fixed the empirical-calibration step's malformed quoted heredoc by using a literal run block.
+3. Added a hard workflow-size guard requiring the workflow to remain below 500,000 bytes.
+4. Kept the bot's default workflow filename aligned with the delivered workflow.
+
+Automatic trading remains disabled in the supplied scanner/bot design.
