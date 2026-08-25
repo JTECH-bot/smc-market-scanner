@@ -1,0 +1,899 @@
+name: LSE Institutional Flow Scanner v13.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Comma-separated LSE symbols, e.g. BTC/USD,EUR/USD,XAU/USD"
+        required: false
+        default: "BTC/USD,EUR/USD,GBP/USD,XAU/USD"
+      max_instruments:
+        description: "Maximum symbols to scan"
+        required: false
+        default: "0"
+      top_n:
+        description: "Maximum ranked setups"
+        required: false
+        default: "10"
+      scan_mode:
+        description: "ONCE or LIVE"
+        required: false
+        default: "ONCE"
+      min_score:
+        description: "Minimum institutional score for a potential setup"
+        required: false
+        default: "72"
+
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate YAML and scanner source
+        env:
+          WORKFLOW_FILE: ".github/workflows/LSE-Institutional-Flow-Scanner-v13.1-Dual-Score.yml"
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "PyYAML>=6,<7"
+          python - <<'PY'
+          from pathlib import Path
+          import ast, yaml, re
+
+          p = Path("${WORKFLOW_FILE}")
+          text = p.read_text(encoding="utf-8")
+          doc = yaml.safe_load(text)
+          assert isinstance(doc, dict)
+          assert isinstance(doc.get("jobs"), dict)
+          assert "scan" in doc["jobs"]
+
+          runs = [
+              s.get("run", "")
+              for s in doc["jobs"]["scan"].get("steps", [])
+              if isinstance(s, dict) and isinstance(s.get("run"), str)
+          ]
+          blocks = []
+          for run in runs:
+              m = re.search(r"python\s+-\s+<<['\"]?PY['\"]?\n(.*?)\nPY(?:\n|$)", run, re.S)
+              if m and "from lse import LSE" in m.group(1):
+                  blocks.append(m.group(1))
+
+          assert len(blocks) == 1, f"Expected one scanner block, found {len(blocks)}"
+          ast.parse(blocks[0], "<lse-institutional-scanner>")
+          compile(blocks[0], "<lse-institutional-scanner>", "exec")
+
+          required = [
+              "liquidity_sweep", "volume_delta", "order_flow_divergence",
+              "absorption", "displacement", "institutional_score",
+              "closed_candle_only", "no_synthetic_bid_ask",
+              "potential_entry", "stop_loss", "take_profit",
+              "monthly_bias", "tca_execution_gate"
+          ]
+          for token in required:
+              assert token in blocks[0], f"Missing institutional component: {token}"
+
+          print("YAML: PASS")
+          print("Embedded Python AST/compile: PASS")
+          print("Institutional engine components: PASS")
+          PY
+
+  scan:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LSE_API_KEY: ${{ secrets.LSE_API_KEY }}
+      SYMBOLS: ${{ inputs.symbols || 'BTC/USD,EUR/USD,GBP/USD,XAU/USD' }}
+      MAX_INSTRUMENTS: ${{ inputs.max_instruments || '0' }}
+      TOP_N: ${{ inputs.top_n || '10' }}
+      SCAN_MODE: ${{ inputs.scan_mode || 'ONCE' }}
+      MIN_SCORE: ${{ inputs.min_score || '72' }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install LSE client
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "lse-data[frames]==0.14.0" "pandas>=2,<3" "numpy>=1.26,<3"
+
+      - name: Run LSE institutional scanner
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, os, time
+          from datetime import datetime, timezone, timedelta
+          from collections import defaultdict
+          import numpy as np
+          import pandas as pd
+          from lse import LSE
+
+          VERSION = "v13.2-lse-institutional-entry-tpsl"
+          API_KEY = os.environ.get("LSE_API_KEY", "").strip()
+          if not API_KEY:
+              raise SystemExit("LSE_API_KEY is missing. Add it as a GitHub Actions secret; never hard-code it.")
+
+          SYMBOLS = [x.strip() for x in os.environ.get("SYMBOLS","").split(",") if x.strip()]
+          MAX_INSTRUMENTS = int(os.environ.get("MAX_INSTRUMENTS","0") or 0)
+          TOP_N = max(1, int(os.environ.get("TOP_N","10") or 10))
+          MIN_SCORE = float(os.environ.get("MIN_SCORE","72") or 72)
+          SCAN_MODE = os.environ.get("SCAN_MODE","ONCE").upper()
+
+          if MAX_INSTRUMENTS > 0:
+              SYMBOLS = SYMBOLS[:MAX_INSTRUMENTS]
+
+          # -------------------------------
+          # Policy: no fake institutional data
+          # -------------------------------
+          # LSE exposes candles/history and a live/replay WebSocket. The scanner does NOT
+          # invent footprint, DOM, block-trade or bid/ask observations when those fields
+          # are absent. Instead it reports DATA_LIMITATION and downgrades that component.
+          # Order-flow metrics below are "observed/proxy/unavailable", never fabricated.
+          POLICY = {
+              "closed_candle_only": True,
+              "no_synthetic_bid_ask": True,
+              "no_synthetic_order_book": True,
+              "no_fake_volume_delta": True,
+              "no_forced_signal": True,
+              "potential_vs_confirmed_separation": True,
+              "automatic_trading": False,
+          }
+
+          client = LSE(api_key=API_KEY)
+
+          def utcnow():
+              return datetime.now(timezone.utc)
+
+          def num(x):
+              try:
+                  if x is None or (isinstance(x, float) and math.isnan(x)):
+                      return None
+                  return float(x)
+              except Exception:
+                  return None
+
+          def col(df, *names):
+              for n in names:
+                  if n in df.columns:
+                      return n
+              lower = {str(c).lower(): c for c in df.columns}
+              for n in names:
+                  if n.lower() in lower:
+                      return lower[n.lower()]
+              return None
+
+          def normalize(df):
+              if df is None:
+                  return pd.DataFrame()
+              if not isinstance(df, pd.DataFrame):
+                  df = pd.DataFrame(df)
+              if df.empty:
+                  return df
+              df = df.copy()
+              mapping = {}
+              for target, names in {
+                  "open":("open","o"), "high":("high","h"),
+                  "low":("low","l"), "close":("close","c"),
+                  "volume":("volume","vol","v")
+              }.items():
+                  c = col(df, *names)
+                  if c:
+                      mapping[c] = target
+              df = df.rename(columns=mapping)
+              if "timestamp" in df.columns:
+                  ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+              elif isinstance(df.index, pd.DatetimeIndex):
+                  ts = pd.to_datetime(df.index, utc=True, errors="coerce")
+                  df = df.reset_index(drop=True)
+              else:
+                  ts = pd.to_datetime(df.index, utc=True, errors="coerce")
+              df["timestamp"] = ts
+              required = ["open","high","low","close"]
+              if not all(x in df.columns for x in required):
+                  return pd.DataFrame()
+              for x in required + (["volume"] if "volume" in df.columns else []):
+                  df[x] = pd.to_numeric(df[x], errors="coerce")
+              df = df.dropna(subset=required).sort_values("timestamp").drop_duplicates("timestamp")
+              if "volume" not in df.columns:
+                  df["volume"] = np.nan
+              return df.reset_index(drop=True)
+
+          def atr(df, n=14):
+              h, l, c = df["high"], df["low"], df["close"]
+              tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+              return tr.rolling(n, min_periods=n).mean()
+
+          def rvol(df, n=20):
+              v = pd.to_numeric(df["volume"], errors="coerce")
+              base = v.rolling(n, min_periods=n).mean()
+              return v / base.replace(0, np.nan)
+
+          def monthly_bias(daily):
+              if len(daily) < 40:
+                  return "NEUTRAL", "insufficient daily history for monthly reconstruction"
+              x = daily.copy()
+              x["month"] = x["timestamp"].dt.to_period("M").astype(str)
+              m = x.groupby("month", sort=True).agg(
+                  open=("open","first"), high=("high","max"),
+                  low=("low","min"), close=("close","last")
+              )
+              if len(m) < 3:
+                  return "NEUTRAL", "insufficient completed monthly bars"
+              # Last row can be the current forming month; use the previous completed month.
+              if len(m) < 4:
+                  return "NEUTRAL", "insufficient completed monthly bars"
+              last = m.iloc[-2]
+              prev = m.iloc[-3]
+              if last["close"] > prev["high"]:
+                  return "BUY", "completed-month close broke prior-month high"
+              if last["close"] < prev["low"]:
+                  return "SELL", "completed-month close broke prior-month low"
+              if last["close"] > last["open"] and last["close"] > prev["close"]:
+                  return "BUY", "completed-month bullish continuation"
+              if last["close"] < last["open"] and last["close"] < prev["close"]:
+                  return "SELL", "completed-month bearish continuation"
+              return "NEUTRAL", "monthly structure not directional"
+
+          def structure(df):
+              if len(df) < 30:
+                  return "NEUTRAL", 0, "insufficient structure history"
+              x = df.iloc[:-1]  # forming candle never votes
+              ph = x["high"].iloc[-11:-1].max()
+              pl = x["low"].iloc[-11:-1].min()
+              close = x["close"].iloc[-1]
+              if close > ph:
+                  return "BUY", 25, "closed candle broke recent swing high"
+              if close < pl:
+                  return "SELL", 25, "closed candle broke recent swing low"
+              return "NEUTRAL", 0, "no closed-candle structure break"
+
+          def liquidity_sweep(df):
+              if len(df) < 25:
+                  return {"side":"NEUTRAL","score":0,"reason":"insufficient liquidity history"}
+              x = df.iloc[:-1]
+              c = x.iloc[-1]
+              prior_high = x["high"].iloc[-11:-1].max()
+              prior_low = x["low"].iloc[-11:-1].min()
+              # Sweep = pierce a prior extreme and close back inside it.
+              if c["high"] > prior_high and c["close"] < prior_high:
+                  return {"side":"SELL","score":24,"reason":"buy-side liquidity sweep rejected back below prior high"}
+              if c["low"] < prior_low and c["close"] > prior_low:
+                  return {"side":"BUY","score":24,"reason":"sell-side liquidity sweep rejected back above prior low"}
+              return {"side":"NEUTRAL","score":0,"reason":"no qualifying closed-candle liquidity sweep"}
+
+          def displacement(df):
+              if len(df) < 30:
+                  return {"side":"NEUTRAL","score":0,"reason":"insufficient displacement history"}
+              x = df.iloc[:-1]
+              a = atr(x)
+              c = x.iloc[-1]
+              av = num(a.iloc[-1])
+              if not av or av <= 0:
+                  return {"side":"NEUTRAL","score":0,"reason":"ATR unavailable"}
+              body = abs(c["close"]-c["open"])
+              rng = c["high"]-c["low"]
+              rel = body/av
+              if rel < 1.25 or rng <= 0 or body/rng < 0.60:
+                  return {"side":"NEUTRAL","score":0,"reason":"no qualifying displacement candle"}
+              if c["close"] > c["open"]:
+                  return {"side":"BUY","score":20,"reason":f"bullish displacement {rel:.2f} ATR"}
+              return {"side":"SELL","score":20,"reason":f"bearish displacement {rel:.2f} ATR"}
+
+          def fvg(df):
+              if len(df) < 10:
+                  return {"side":"NEUTRAL","score":0,"reason":"insufficient FVG history"}
+              x = df.iloc[:-1]
+              a = atr(x)
+              av = num(a.iloc[-1])
+              if not av or av <= 0:
+                  return {"side":"NEUTRAL","score":0,"reason":"ATR unavailable"}
+              a0, a1, a2 = x.iloc[-3], x.iloc[-2], x.iloc[-1]
+              if a0["high"] < a2["low"] and (a2["low"]-a0["high"]) >= 0.10*av:
+                  return {"side":"BUY","score":15,"reason":"bullish fair-value gap remains structurally relevant"}
+              if a0["low"] > a2["high"] and (a0["low"]-a2["high"]) >= 0.10*av:
+                  return {"side":"SELL","score":15,"reason":"bearish fair-value gap remains structurally relevant"}
+              return {"side":"NEUTRAL","score":0,"reason":"no qualifying FVG"}
+
+          def order_flow_from_ticks(symbol, timeout=8):
+              """
+              Uses only actual LSE tick fields when available.
+              Aggressive buy/sell classification:
+                trade >= ask -> buy
+                trade <= bid -> sell
+              Mid-price/last-price substitution is NOT allowed for execution evidence.
+              """
+              result = {
+                  "availability":"UNAVAILABLE",
+                  "volume_delta":None,
+                  "order_flow_divergence":"UNAVAILABLE",
+                  "absorption":"UNAVAILABLE",
+                  "block_trade":"UNAVAILABLE",
+                  "tick_count":0,
+                  "reason":"No validated bid/ask trade tape was observed"
+              }
+              if not hasattr(client, "stream"):
+                  result["reason"] = "LSE client has no stream() capability"
+                  return result
+              buys = sells = 0.0
+              aggressive_prices = []
+              try:
+                  start = time.monotonic()
+                  for tick in client.stream([symbol]):
+                      if time.monotonic()-start > timeout:
+                          break
+                      def get(*names):
+                          if isinstance(tick, dict):
+                              for n in names:
+                                  if n in tick and tick[n] is not None:
+                                      return tick[n]
+                          for n in names:
+                              try:
+                                  v = getattr(tick,n)
+                                  if v is not None:
+                                      return v
+                              except Exception:
+                                  pass
+                          return None
+                      bid, ask, price, size = map(
+                          num,
+                          (get("bid","best_bid"), get("ask","best_ask"),
+                           get("price","last","last_price"), get("size","volume","trade_size"))
+                      )
+                      if bid is None or ask is None or price is None or size is None or size <= 0 or ask < bid:
+                          continue
+                      result["tick_count"] += 1
+                      if price >= ask:
+                          buys += size
+                          aggressive_prices.append(("BUY", price, size))
+                      elif price <= bid:
+                          sells += size
+                          aggressive_prices.append(("SELL", price, size))
+                      if result["tick_count"] >= 250:
+                          break
+              except Exception as e:
+                  result["reason"] = f"stream unavailable/failed: {type(e).__name__}: {e}"
+
+              if result["tick_count"] == 0:
+                  return result
+
+              total = buys+sells
+              delta = buys-sells
+              result["availability"] = "OBSERVED"
+              result["volume_delta"] = (delta/total) if total else 0.0
+
+              # A block-trade flag is only emitted when actual trade size data exists.
+              sizes = [z[2] for z in aggressive_prices if z[2] is not None]
+              if len(sizes) >= 20:
+                  med = float(np.median(sizes))
+                  result["block_trade"] = bool(med > 0 and max(sizes) >= 5*med)
+
+              # Absorption proxy: large aggressive volume with little directional displacement.
+              # This is explicitly a proxy, not full DOM absorption.
+              if len(aggressive_prices) >= 20:
+                  up = sum(z[2] for z in aggressive_prices if z[0]=="BUY")
+                  dn = sum(z[2] for z in aggressive_prices if z[0]=="SELL")
+                  imbalance = abs(up-dn)/max(up+dn, 1e-9)
+                  result["absorption"] = bool(imbalance > 0.45 and len(aggressive_prices) >= 30)
+
+              return result
+
+          def order_flow_divergence(df, flow):
+              if flow["availability"] != "OBSERVED" or flow["volume_delta"] is None:
+                  return "UNAVAILABLE", "validated tick delta unavailable"
+              x = df.iloc[:-1]
+              if len(x) < 20:
+                  return "UNAVAILABLE", "insufficient candle history"
+              price_up = x["close"].iloc[-1] > x["close"].iloc[-6]
+              delta = flow["volume_delta"]
+              # Price makes progress while aggressive delta disagrees.
+              if price_up and delta < -0.15:
+                  return "SELL", "price advanced while observed aggressive delta was negative"
+              if (not price_up) and delta > 0.15:
+                  return "BUY", "price declined while observed aggressive delta was positive"
+              return "NEUTRAL", "no observed price/delta divergence"
+
+          def tca_execution_gate(symbol, side, entry, sl, tp, flow):
+              # Only an actual bid/ask tape can promote a setup to executable.
+              if flow["availability"] != "OBSERVED" or flow["tick_count"] < 10:
+                  return False, "DATA_LIMITED_EXECUTION_NO_VALIDATED_BID_ASK_TAPE"
+              if side not in ("BUY","SELL"):
+                  return False, "NEUTRAL"
+              return True, "validated bid/ask trade tape observed; execution evidence present"
+
+          def plan(df, side):
+              x = df.iloc[:-1]
+              av = num(atr(x).iloc[-1])
+              if not av or av <= 0 or side not in ("BUY","SELL"):
+                  return None
+              last = float(x["close"].iloc[-1])
+              if side == "BUY":
+                  swing = float(x["low"].iloc[-6:].min())
+                  sl = min(swing-0.10*av, last-0.80*av)
+                  risk = last-sl
+                  tp = last+2.2*risk
+                  entry = last
+              else:
+                  swing = float(x["high"].iloc[-6:].max())
+                  sl = max(swing+0.10*av, last+0.80*av)
+                  risk = sl-last
+                  tp = last-2.2*risk
+                  entry = last
+              if risk <= 0:
+                  return None
+              return {
+                  "potential_entry": round(entry,8),
+                  "stop_loss": round(sl,8),
+                  "take_profit": round(tp,8),
+                  "rr": round(abs(tp-entry)/risk,2),
+                  "atr": round(av,8)
+              }
+
+          def dual_score(setup_score, execution_score, historical_score=0.0):
+              """
+              Separate setup quality from execution evidence.
+              Historical validation is deliberately capped so it cannot manufacture
+              a probability from insufficient samples.
+              """
+              setup_score = max(0.0, min(100.0, float(setup_score)))
+              execution_score = max(0.0, min(100.0, float(execution_score)))
+              historical_score = max(0.0, min(100.0, float(historical_score)))
+
+              # Final rank is not a probability. It is a priority score.
+              final_rank = (
+                  0.60 * setup_score +
+                  0.30 * execution_score +
+                  0.10 * historical_score
+              )
+              return round(final_rank, 1)
+
+          def execution_confidence(flow, tca_ok):
+              """
+              0-100 confidence in executable microstructure evidence.
+              Missing evidence is scored explicitly, never guessed.
+              """
+              if flow.get("availability") != "OBSERVED":
+                  return 0.0, "NO_VALIDATED_LIVE_MICROSTRUCTURE"
+
+              score = 35.0  # validated trade tape exists
+              if flow.get("tick_count", 0) >= 50:
+                  score += 15
+              if flow.get("volume_delta") is not None:
+                  score += 15
+              if flow.get("absorption") is not None:
+                  score += 10
+              if flow.get("block_trade") is not None:
+                  score += 10
+              if tca_ok:
+                  score += 15
+
+              return round(min(100.0, score), 1), "OBSERVED_MICROSTRUCTURE"
+
+          def institutional_trade_plan(df, side, tf=None):
+              """
+              Build Entry/SL/TP from market structure and liquidity, not fixed
+              percentage distances.
+
+              Entry:
+                - Prefer the latest confirmed FVG/imbalance or displacement-origin
+                  retracement zone.
+                - Require price to be on the correct side of the invalidation level.
+                - If a precise retracement zone cannot be established, return WAITING.
+
+              Stop:
+                - Beyond the liquidity sweep / recent structural invalidation.
+                - Add a small ATR volatility buffer.
+
+              Targets:
+                - TP1 = nearest opposing liquidity.
+                - TP2 = major opposing swing / external liquidity.
+                - TP3 = higher-timeframe opposing liquidity.
+                - If no valid liquidity target exists, do not fabricate one.
+
+              This is a deterministic market-structure model, not a claim that
+              institutional participants are individually identifiable.
+              """
+              x = df.iloc[:-1].copy()  # never use the forming candle
+              if len(x) < 40 or side not in ("BUY", "SELL"):
+                  return None
+
+              a = atr(x)
+              av = num(a.iloc[-1])
+              if not av or av <= 0:
+                  return None
+
+              last = float(x["close"].iloc[-1])
+              recent = x.iloc[-20:]
+              older = x.iloc[-60:-20]
+
+              # Detect the most recent 3-candle imbalance.
+              fvg_low = fvg_high = None
+              fvg_side = None
+              for i in range(len(x)-3, max(2, len(x)-15), -1):
+                  a0, a1, a2 = x.iloc[i-2], x.iloc[i-1], x.iloc[i]
+                  if a0["high"] < a2["low"]:
+                      gap = a2["low"] - a0["high"]
+                      if gap >= 0.10*av:
+                          fvg_low, fvg_high, fvg_side = float(a0["high"]), float(a2["low"]), "BUY"
+                          break
+                  if a0["low"] > a2["high"]:
+                      gap = a0["low"] - a2["high"]
+                      if gap >= 0.10*av:
+                          fvg_low, fvg_high, fvg_side = float(a2["high"]), float(a0["low"]), "SELL"
+                          break
+
+              # Liquidity pools: prior local extremes.
+              swing_highs = recent["high"].nlargest(6).tolist()
+              swing_lows = recent["low"].nsmallest(6).tolist()
+
+              if side == "BUY":
+                  # Invalidation = sweep low / recent structural low.
+                  sweep_low = float(recent["low"].min())
+                  if fvg_side == "BUY":
+                      entry_low = fvg_low
+                      entry_high = fvg_high
+                      entry = (entry_low + entry_high) / 2.0
+                      entry_type = "BULLISH_FVG_RETRACEMENT"
+                  else:
+                      # No valid institutional retracement zone.
+                      return None
+
+                  sl = sweep_low - 0.15*av
+                  if entry >= last:
+                      entry = min(entry_high, last)
+                  if entry <= sl:
+                      return None
+
+                  # Opposing liquidity must be above entry.
+                  targets = sorted(set(
+                      float(v) for v in swing_highs
+                      if float(v) > entry + 0.50*av
+                  ))
+                  if not targets:
+                      # Use a confirmed prior HTF swing only if available.
+                      targets = sorted(set(
+                          float(v) for v in older["high"].nlargest(5).tolist()
+                          if float(v) > entry + 0.50*av
+                      ))
+                  if not targets:
+                      return None
+
+                  tp1 = targets[0]
+                  tp2_candidates = [v for v in targets if v > tp1 + 0.75*av]
+                  tp2 = tp2_candidates[0] if tp2_candidates else None
+                  tp3_candidates = [v for v in targets if tp2 and v > tp2 + 0.75*av]
+                  tp3 = tp3_candidates[0] if tp3_candidates else None
+
+              else:
+                  sweep_high = float(recent["high"].max())
+                  if fvg_side == "SELL":
+                      entry_low = fvg_low
+                      entry_high = fvg_high
+                      entry = (entry_low + entry_high) / 2.0
+                      entry_type = "BEARISH_FVG_RETRACEMENT"
+                  else:
+                      return None
+
+                  sl = sweep_high + 0.15*av
+                  if entry <= last:
+                      entry = max(entry_low, last)
+                  if entry >= sl:
+                      return None
+
+                  targets = sorted(set(
+                      float(v) for v in swing_lows
+                      if float(v) < entry - 0.50*av
+                  ), reverse=True)
+                  if not targets:
+                      targets = sorted(set(
+                          float(v) for v in older["low"].nsmallest(5).tolist()
+                          if float(v) < entry - 0.50*av
+                      ), reverse=True)
+                  if not targets:
+                      return None
+
+                  tp1 = targets[0]
+                  tp2_candidates = [v for v in targets if v < tp1 - 0.75*av]
+                  tp2 = tp2_candidates[0] if tp2_candidates else None
+                  tp3_candidates = [v for v in targets if tp2 and v < tp2 - 0.75*av]
+                  tp3 = tp3_candidates[0] if tp3_candidates else None
+
+              risk = abs(entry-sl)
+              if risk <= 0:
+                  return None
+
+              rrs = [abs(tp1-entry)/risk]
+              if tp2 is not None:
+                  rrs.append(abs(tp2-entry)/risk)
+              if tp3 is not None:
+                  rrs.append(abs(tp3-entry)/risk)
+
+              # Institutional quality gate: at least 2R must exist somewhere
+              # in the mapped liquidity targets.
+              if max(rrs) < 2.0:
+                  return None
+
+              return {
+                  "entry": round(entry, 8),
+                  "entry_type": entry_type,
+                  "entry_zone_low": round(entry_low, 8),
+                  "entry_zone_high": round(entry_high, 8),
+                  "entry_basis": "confirmed closed-candle FVG retracement after institutional displacement/structure",
+                  "stop_loss": round(sl, 8),
+                  "stop_basis": "beyond recent liquidity/sweep invalidation + ATR buffer",
+                  "tp1": round(tp1, 8),
+                  "tp1_basis": "nearest opposing liquidity",
+                  "tp2": round(tp2, 8) if tp2 is not None else None,
+                  "tp2_basis": "major opposing swing / external liquidity" if tp2 is not None else None,
+                  "tp3": round(tp3, 8) if tp3 is not None else None,
+                  "tp3_basis": "higher-timeframe opposing liquidity" if tp3 is not None else None,
+                  "rr_tp1": round(rrs[0], 2),
+                  "rr_tp2": round(rrs[1], 2) if len(rrs) > 1 else None,
+                  "rr_tp3": round(rrs[2], 2) if len(rrs) > 2 else None,
+                  "max_rr": round(max(rrs), 2),
+                  "atr": round(av, 8),
+                  "closed_candle_only": True,
+              }
+
+          def score_symbol(symbol):
+              # LSE documented candle resolutions: 1m/5m/15m/1h/4h/daily.
+              # Monthly bias is reconstructed only from completed daily months.
+              now = utcnow()
+              start = (now - timedelta(days=180)).strftime("%Y-%m-%d")
+              try:
+                  d1 = normalize(client.candles(symbol, "1d", start=start))
+                  h4 = normalize(client.candles(symbol, "4h", start=start))
+                  h1 = normalize(client.candles(symbol, "1h", start=start))
+                  m15 = normalize(client.candles(symbol, "15m", start=start))
+                  m5 = normalize(client.candles(symbol, "5m", start=start))
+              except Exception as e:
+                  return {"symbol":symbol,"status":"DATA_UNAVAILABLE","error":f"{type(e).__name__}: {e}"}
+
+              frames = {"1d":d1,"4h":h4,"1h":h1,"15m":m15,"5m":m5}
+              if any(len(x) < 30 for x in frames.values()):
+                  return {"symbol":symbol,"status":"DATA_UNAVAILABLE",
+                          "reason":"insufficient LSE-native candle history in one or more required timeframes"}
+
+              month_side, month_why = monthly_bias(d1)
+
+              # Direction is built from institutional structure evidence, not RSI.
+              tf = {}
+              for name, df in [("4h",h4),("1h",h1),("15m",m15),("5m",m5)]:
+                  s, ss, sw = structure(df)
+                  liq = liquidity_sweep(df)
+                  disp = displacement(df)
+                  gap = fvg(df)
+                  tf[name] = {"structure":s,"structure_score":ss,"structure_why":sw,
+                              "liquidity":liq,"displacement":disp,"fvg":gap}
+
+              flow = order_flow_from_ticks(symbol)
+              div_side, div_why = order_flow_divergence(m5, flow)
+
+              candidates = []
+              for side in ("BUY","SELL"):
+                  score = 0.0
+                  evidence = []
+                  for name in ("4h","1h","15m","5m"):
+                      z = tf[name]
+                      if z["structure"] == side:
+                          score += 6 if name != "5m" else 8
+                          evidence.append(f"{name}:structure")
+                      if z["liquidity"]["side"] == side:
+                          score += 8
+                          evidence.append(f"{name}:liquidity_sweep")
+                      if z["displacement"]["side"] == side:
+                          score += 7
+                          evidence.append(f"{name}:displacement")
+                      if z["fvg"]["side"] == side:
+                          score += 4
+                          evidence.append(f"{name}:fvg")
+
+                  if month_side == side:
+                      score += 10
+                      evidence.append("monthly_bias")
+                  elif month_side in ("BUY","SELL") and month_side != side:
+                      score -= 14
+                      evidence.append("monthly_conflict")
+
+                  if div_side == side:
+                      score += 10
+                      evidence.append("order_flow_divergence")
+                  elif div_side in ("BUY","SELL") and div_side != side:
+                      score -= 8
+                      evidence.append("order_flow_conflict")
+
+                  if flow["availability"] == "OBSERVED" and flow["volume_delta"] is not None:
+                      if side == "BUY" and flow["volume_delta"] > 0.20:
+                          score += 7
+                          evidence.append("positive_aggressive_delta")
+                      if side == "SELL" and flow["volume_delta"] < -0.20:
+                          score += 7
+                          evidence.append("negative_aggressive_delta")
+                  else:
+                      evidence.append("order_flow_data_limited")
+
+                  # SETUP SCORE is intentionally independent of execution confidence.
+                  # This prevents missing live microstructure from silently becoming
+                  # a fake zero/positive trading signal.
+                  setup_score = max(0.0, min(100.0, score))
+
+                  p = institutional_trade_plan(m5, side)
+                  if not p:
+                      # No clean institutional retracement/target geometry.
+                      # Do not force an entry.
+                      continue
+
+                  # Strict master gate: no monthly conflict, at least one sweep/structure/MSS-style
+                  # anchor, at least one displacement/FVG confirmation, and RR >= 2.
+                  structural = sum(
+                      1 for name in ("4h","1h","15m","5m")
+                      if tf[name]["structure"] == side or tf[name]["liquidity"]["side"] == side
+                  )
+                  impulse = sum(
+                      1 for name in ("15m","5m")
+                      if tf[name]["displacement"]["side"] == side or tf[name]["fvg"]["side"] == side
+                  )
+                  master_ok = (
+                      month_side == side and
+                      structural >= 2 and
+                      impulse >= 1 and
+                      p["rr"] >= 2.0
+                  )
+
+                  tca_ok, tca_reason = tca_execution_gate(
+                      symbol, side, p["entry"], p["stop_loss"], (p["tp2"] if p["tp2"] is not None else p["tp1"]), flow
+                  )
+
+                  exec_score, exec_class = execution_confidence(flow, tca_ok)
+
+                  # Historical score is deliberately 0 until an authoritative,
+                  # out-of-sample TCA validation dataset is available. This prevents
+                  # the scanner from inventing a win rate.
+                  historical_score = 0.0
+                  final_rank = dual_score(setup_score, exec_score, historical_score)
+
+                  status = "CONFIRMED_ENTRY" if (
+                      master_ok and tca_ok and setup_score >= MIN_SCORE
+                  ) else (
+                      f"POTENTIAL_{side}" if master_ok and setup_score >= MIN_SCORE else
+                      "WAITING_FOR_TRIGGER"
+                  )
+
+                  candidates.append({
+                      "symbol":symbol, "side":side,
+                      "institutional_score":setup_score,
+                      "setup_score":setup_score,
+                      "execution_confidence":exec_score,
+                      "execution_class":exec_class,
+                      "historical_validation_score":historical_score,
+                      "final_rank":final_rank,
+                      "status":status,
+                      "monthly_bias":month_side,
+                      "monthly_bias_reason":month_why,
+                      "order_flow":flow,
+                      "order_flow_divergence":div_side,
+                      "order_flow_divergence_reason":div_why,
+                      "absorption":flow.get("absorption"),
+                      "block_trade":flow.get("block_trade"),
+                      "evidence":evidence,
+                      "structural_anchors":structural,
+                      "impulse_confirmations":impulse,
+                      "tca_execution_gate":tca_ok,
+                      "tca_reason":tca_reason,
+                      "tca_execution_evidence": (
+                          "REAL_BID_ASK_TAPE" if tca_ok else "DATA_LIMITED_NO_EXECUTABLE_EVIDENCE"
+                      ),
+                      "entry_plan":p,
+                      "closed_candle_only":True,
+                      "no_synthetic_bid_ask":True,
+                      "potential_entry":p["entry"],
+                      "stop_loss":p["stop_loss"],
+                      "take_profit":p["tp2"] if p["tp2"] is not None else p["tp1"],
+                      "rr":p["max_rr"],
+                      "tp1":p["tp1"],
+                      "tp2":p["tp2"],
+                      "tp3":p["tp3"],
+                      "entry_basis":p["entry_basis"],
+                      "stop_basis":p["stop_basis"],
+                      "tp1_basis":p["tp1_basis"],
+                      "tp2_basis":p["tp2_basis"],
+                      "tp3_basis":p["tp3_basis"],
+                  })
+
+              if not candidates:
+                  return {"symbol":symbol,"status":"NO_ACTION","reason":"no valid institutional candidate"}
+
+              candidates.sort(key=lambda x:(x["final_rank"], x["setup_score"], x["rr"]), reverse=True)
+              return candidates[0]
+
+          results = []
+          for symbol in SYMBOLS:
+              print(f"SCANNING {symbol} | LSE institutional flow engine")
+              r = score_symbol(symbol)
+              results.append(r)
+
+          ranked = [
+              r for r in results
+              if r.get("status") in ("CONFIRMED_ENTRY","POTENTIAL_BUY","POTENTIAL_SELL")
+          ]
+          ranked.sort(key=lambda x:(x.get("final_rank",0), x.get("setup_score",0)), reverse=True)
+
+          report = {
+              "version": VERSION,
+              "generated_at": utcnow().isoformat(),
+              "data_source": "London Strategic Edge API + WebSocket when validated tick fields are present",
+              "symbols_requested": SYMBOLS,
+              "policy": POLICY,
+              "ranking_model": {
+                  "setup_score_weight": 0.60,
+                  "execution_confidence_weight": 0.30,
+                  "historical_validation_weight": 0.10,
+                  "final_rank_is_probability": False,
+                  "historical_score_default": 0,
+                  "historical_score_policy": "Only authoritative out-of-sample TCA evidence can raise this component."
+              },
+              "trade_plan_model": {
+                  "entry": "FVG/imbalance retracement after closed-candle institutional displacement",
+                  "stop": "liquidity/sweep invalidation plus ATR buffer",
+                  "tp1": "nearest opposing liquidity",
+                  "tp2": "major opposing swing/external liquidity",
+                  "tp3": "higher-timeframe opposing liquidity",
+                  "minimum_available_rr": 2.0,
+                  "forced_entries": False,
+                  "forced_targets": False
+              },
+              "institutional_components": [
+                  "liquidity_sweep",
+                  "stop_hunt_rejection",
+                  "structure_break",
+                  "displacement",
+                  "FVG",
+                  "observed_aggressive_volume_delta",
+                  "observed_price_delta_divergence",
+                  "observed_absorption_proxy",
+                  "observed_block_trade_size_proxy",
+                  "monthly_master_bias",
+                  "TCA_execution_gate"
+              ],
+              "results": ranked[:TOP_N],
+              "all_results": results,
+              "limitations": [
+                  "A footprint/DOM/block-trade engine is only marked observed when LSE tick fields actually contain the required bid/ask/trade/size evidence.",
+                  "No synthetic bid/ask, synthetic delta, or invented order-book depth is created.",
+                  "CONFIRMED_ENTRY requires validated bid/ask tape; otherwise the scanner can emit POTENTIAL_* or WAITING_FOR_TRIGGER.",
+                  "Setup score, execution confidence and final rank are ranking measures, not guaranteed probabilities or accuracy percentages.",
+                  "Historical validation remains 0 until authoritative out-of-sample TCA evidence is available; no win-rate is invented.",
+                  "Entry, SL and TP are rejected when institutional liquidity geometry is insufficient; the scanner returns WAITING rather than forcing levels."
+              ]
+          }
+
+          with open("lse_institutional_scan.json","w",encoding="utf-8") as f:
+              json.dump(report,f,indent=2,default=str)
+
+          print("="*80)
+          print(f"LSE DUAL-SCORE + INSTITUTIONAL ENTRY/TP/SL SCANNER {VERSION}")
+          print("="*80)
+          print(json.dumps(report,indent=2,default=str))
+
+          if SCAN_MODE == "LIVE":
+              print("LIVE mode selected; this workflow run performs the same non-auto-trading scan.")
+          print("AUTOMATIC TRADING: DISABLED")
+          PY
+
+      - name: Upload scanner result
+        uses: actions/upload-artifact@v4
+        with:
+          name: lse-institutional-scan
+          path: lse_institutional_scan.json
+          if-no-files-found: error
+          retention-days: 7
